@@ -30,6 +30,9 @@ use OCA\Activity\BackgroundJob\RemoteActivity;
 use OCA\Activity\Extension\Files;
 use OCA\Activity\Extension\Files_Sharing;
 use OCP\Activity\IManager;
+use OCP\Files\Config\ICachedMountFileInfo;
+use OCP\Files\Config\ICachedMountInfo;
+use OCP\Files\Config\IUserMountCache;
 use OCP\Files\IRootFolder;
 use OCP\Files\Mount\IMountPoint;
 use OCP\Files\Node;
@@ -93,6 +96,8 @@ class FilesHooks {
 	protected $oldParentOwner;
 	/** @var string */
 	protected $oldParentId;
+	/** @var IUserMountCache */
+	protected $userMountCache;
 
 	/**
 	 * Constructor
@@ -108,6 +113,7 @@ class FilesHooks {
 	 * @param IURLGenerator $urlGenerator
 	 * @param ILogger $logger
 	 * @param CurrentUser $currentUser
+	 * @param IUserMountCache $userMountCache
 	 */
 	public function __construct(IManager $manager,
 								Data $activityData,
@@ -119,7 +125,8 @@ class FilesHooks {
 								IDBConnection $connection,
 								IURLGenerator $urlGenerator,
 								ILogger $logger,
-								CurrentUser $currentUser) {
+								CurrentUser $currentUser,
+								IUserMountCache $userMountCache) {
 		$this->manager = $manager;
 		$this->activityData = $activityData;
 		$this->userSettings = $userSettings;
@@ -131,10 +138,12 @@ class FilesHooks {
 		$this->urlGenerator = $urlGenerator;
 		$this->logger = $logger;
 		$this->currentUser = $currentUser;
+		$this->userMountCache = $userMountCache;
 	}
 
 	/**
 	 * Store the create hook events
+	 *
 	 * @param string $path Path of the file that has been created
 	 */
 	public function fileCreate($path) {
@@ -151,6 +160,7 @@ class FilesHooks {
 
 	/**
 	 * Store the update hook events
+	 *
 	 * @param string $path Path of the file that has been modified
 	 */
 	public function fileUpdate($path) {
@@ -159,6 +169,7 @@ class FilesHooks {
 
 	/**
 	 * Store the delete hook events
+	 *
 	 * @param string $path Path of the file that has been deleted
 	 */
 	public function fileDelete($path) {
@@ -167,6 +178,7 @@ class FilesHooks {
 
 	/**
 	 * Store the restore hook events
+	 *
 	 * @param string $path Path of the file that has been restored
 	 */
 	public function fileRestore($path) {
@@ -176,10 +188,10 @@ class FilesHooks {
 	/**
 	 * Creates the entries for file actions on $file_path
 	 *
-	 * @param string $filePath         The file that is being changed
-	 * @param int    $activityType     The activity type
-	 * @param string $subject          The subject for the actor
-	 * @param string $subjectBy        The subject for other users (with "by $actor")
+	 * @param string $filePath The file that is being changed
+	 * @param int $activityType The activity type
+	 * @param string $subject The subject for the actor
+	 * @param string $subjectBy The subject for other users (with "by $actor")
 	 */
 	protected function addNotificationsForFileAction($filePath, $activityType, $subject, $subjectBy) {
 		// Do not add activities for .part-files
@@ -197,12 +209,19 @@ class FilesHooks {
 
 		$this->generateRemoteActivity($accessList['remotes'], $activityType, time(), $this->currentUser->getCloudId(), $accessList['ownerPath']);
 
-		$affectedUsers = $accessList['users'];
+		$mountsForFile = $this->userMountCache->getMountsForFileId($fileId);
+		$affectedUserIds = array_map(function (ICachedMountInfo $mount) {
+			return $mount->getUser()->getUID();
+		}, $mountsForFile);
+		$affectedPaths = array_map(function (ICachedMountFileInfo $mount) {
+			return $mount->getPath();
+		}, $mountsForFile);
+		$affectedUsers = array_combine($affectedUserIds, $affectedPaths);
 		$filteredStreamUsers = $this->userSettings->filterUsersBySetting(array_keys($affectedUsers), 'stream', $activityType);
 		$filteredEmailUsers = $this->userSettings->filterUsersBySetting(array_keys($affectedUsers), 'email', $activityType);
 
 		foreach ($affectedUsers as $user => $path) {
-			$user = (string) $user;
+			$user = (string)$user;
 			if (empty($filteredStreamUsers[$user]) && empty($filteredEmailUsers[$user])) {
 				continue;
 			}
@@ -369,8 +388,8 @@ class FilesHooks {
 		$renameRemotes = [];
 		foreach ($accessList['remotes'] as $remote => $info) {
 			$renameRemotes[$remote] = [
-				'token'       => $info['token'],
-				'node_path'   => substr($newPath, strlen($info['node_path'])),
+				'token' => $info['token'],
+				'node_path' => substr($newPath, strlen($info['node_path'])),
 				'second_path' => substr($oldPath, strlen($info['node_path'])),
 			];
 		}
@@ -645,7 +664,7 @@ class FilesHooks {
 				// Probably a remote user, let's try to at least generate activities
 				// for the current user
 				if ($currentUser === null) {
-					list(,$owner,) = explode('/', $view->getAbsolutePath($path), 3);
+					list(, $owner,) = explode('/', $view->getAbsolutePath($path), 3);
 				} else {
 					$owner = $currentUser;
 				}
@@ -655,7 +674,7 @@ class FilesHooks {
 		$info = Filesystem::getFileInfo($path);
 		if ($info !== false) {
 			$ownerView = new View('/' . $owner . '/files');
-			$fileId = (int) $info['fileid'];
+			$fileId = (int)$info['fileid'];
 			$path = $ownerView->getPath($fileId);
 		}
 
@@ -664,16 +683,17 @@ class FilesHooks {
 
 	/**
 	 * Manage sharing events
+	 *
 	 * @param array $params The hook params
 	 */
 	public function share($params) {
 		if ($params['itemType'] === 'file' || $params['itemType'] === 'folder') {
-			if ((int) $params['shareType'] === Share::SHARE_TYPE_USER) {
-				$this->shareWithUser($params['shareWith'], (int) $params['fileSource'], $params['itemType'], $params['fileTarget']);
-			} else if ((int) $params['shareType'] === Share::SHARE_TYPE_GROUP) {
-				$this->shareWithGroup($params['shareWith'], (int) $params['fileSource'], $params['itemType'], $params['fileTarget'], (int) $params['id']);
-			} else if ((int) $params['shareType'] === Share::SHARE_TYPE_LINK) {
-				$this->shareByLink((int) $params['fileSource'], $params['itemType'], $params['uidOwner']);
+			if ((int)$params['shareType'] === Share::SHARE_TYPE_USER) {
+				$this->shareWithUser($params['shareWith'], (int)$params['fileSource'], $params['itemType'], $params['fileTarget']);
+			} else if ((int)$params['shareType'] === Share::SHARE_TYPE_GROUP) {
+				$this->shareWithGroup($params['shareWith'], (int)$params['fileSource'], $params['itemType'], $params['fileTarget'], (int)$params['id']);
+			} else if ((int)$params['shareType'] === Share::SHARE_TYPE_LINK) {
+				$this->shareByLink((int)$params['fileSource'], $params['itemType'], $params['uidOwner']);
 			}
 		}
 	}
@@ -696,7 +716,7 @@ class FilesHooks {
 		// New shared user
 		$this->addNotificationsForUser(
 			$shareWith, 'shared_with_by', [[$fileSource => $fileTarget], $this->currentUser->getUserIdentifier()],
-			(int) $fileSource, $fileTarget, $itemType === 'file',
+			(int)$fileSource, $fileTarget, $itemType === 'file',
 			$this->userSettings->getUserSetting($shareWith, 'stream', Files_Sharing::TYPE_SHARED),
 			$this->userSettings->getUserSetting($shareWith, 'email', Files_Sharing::TYPE_SHARED) ? $this->userSettings->getUserSetting($shareWith, 'setting', 'batchtime') : 0
 		);
@@ -753,7 +773,7 @@ class FilesHooks {
 
 		$this->addNotificationsForUser(
 			$linkOwner, 'shared_link_self', [[$fileSource => $path]],
-			(int) $fileSource, $path, $itemType === 'file',
+			(int)$fileSource, $path, $itemType === 'file',
 			$this->userSettings->getUserSetting($linkOwner, 'stream', Files_Sharing::TYPE_SHARED),
 			$this->userSettings->getUserSetting($linkOwner, 'email', Files_Sharing::TYPE_SHARED) ? $this->userSettings->getUserSetting($linkOwner, 'setting', 'batchtime') : 0
 		);
@@ -761,6 +781,7 @@ class FilesHooks {
 
 	/**
 	 * Manage unsharing events
+	 *
 	 * @param IShare $share
 	 * @throws \OCP\Files\NotFoundException
 	 */
@@ -917,7 +938,7 @@ class FilesHooks {
 		$queryBuilder->select(['share_with', 'file_target'])
 			->from('share')
 			->where($queryBuilder->expr()->eq('parent', $queryBuilder->createParameter('parent')))
-			->setParameter('parent', (int) $shareId);
+			->setParameter('parent', (int)$shareId);
 		$query = $queryBuilder->execute();
 
 		while ($row = $query->fetch()) {
